@@ -2,6 +2,9 @@ package main
 
 import (
 	"bytes"
+	_ "crypto/md5"    // make MD5 hash available for signature check
+	_ "crypto/sha256" // make SHA224/256 hashes available for signature check
+	_ "crypto/sha512" // make SHA384/512 hashes available for signature check
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -107,7 +110,6 @@ func parseKeyValue(keyvalue string) (kvtype, string, string) {
 }
 
 func parseArgs(args []string) (*kvpairs, error) {
-
 	kvp := kvpairs{
 		headers: make(map[string]string),
 		query:   make(map[string][]string),
@@ -426,7 +428,18 @@ func main() {
 		os.Stdout.Write([]byte{'\n', '\n'})
 	}
 
-	response, err := http.DefaultClient.Do(req)
+	client := http.DefaultClient
+	if *insecure {
+		client = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
+	}
+
+	response, err := client.Do(req)
 
 	if err != nil {
 		log.Fatal("error during fetch:", err)
@@ -487,6 +500,10 @@ func main() {
 
 	if response.StatusCode >= 400 {
 		os.Exit(response.StatusCode - 399)
+	}
+
+	if !*onlyBody {
+		printResponseTrailers(*color, response)
 	}
 }
 
@@ -628,6 +645,11 @@ func printResponseHeaders(useColor bool, response *http.Response) {
 	fmt.Println()
 }
 
+func printResponseTrailers(useColor bool, response *http.Response) {
+	printHeaders(useColor, response.Trailer)
+	fmt.Println()
+}
+
 func printHeaders(useColor bool, headers http.Header) {
 
 	var keys []string
@@ -646,14 +668,18 @@ func printHeaders(useColor bool, headers http.Header) {
 			ct.ResetColor()
 			fmt.Printf(": ")
 			ct.ChangeColor(ct.Yellow, false, ct.None, false)
-			fmt.Printf("%s", headers[k][0])
+			if len(headers[k]) > 0 {
+				fmt.Printf("%s", headers[k][0])
+			}
 			ct.ResetColor()
 			fmt.Println()
 		}
 
 	} else {
 		for _, k := range keys {
-			fmt.Printf("%s: %s\n", k, headers[k][0])
+			if len(headers[k]) > 0 {
+				fmt.Printf("%s: %s\n", k, headers[k][0])
+			}
 		}
 	}
 }
