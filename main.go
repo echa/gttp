@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -183,6 +184,9 @@ func main() {
 	noFormatting := flag.Bool("n", false, "no formatting/colour")
 	rawOutput := flag.Bool("raw", false, "raw output (no headers/formatting/color)")
 	useMultipart := flag.Bool("m", true, "use multipart if uploading files")
+	timeout := flag.Duration("t", 0, "timeout (default none)")
+	insecure := flag.Bool("k", false, "allow insecure TLS")
+	useEnv := flag.Bool("e", true, "use proxies from environment")
 
 	flag.Parse()
 
@@ -202,6 +206,20 @@ func main() {
 		return
 	}
 
+	if *timeout != 0 {
+		http.DefaultClient.Timeout = *timeout
+	}
+
+	if *insecure {
+		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
+			InsecureSkipVerify: true,
+		}
+	}
+
+	if !*useEnv {
+		http.DefaultTransport.(*http.Transport).Proxy = nil
+	}
+
 	args := flag.Args()
 
 	method := "GET"
@@ -212,7 +230,7 @@ func main() {
 	}
 
 	switch args[0] {
-	case "GET", "HEAD", "POST", "PUT", "DELETE", "PURGE":
+	case "GET", "HEAD", "POST", "PUT", "DELETE", "PURGE", "TRACE", "OPTIONS", "CONNECT", "PATCH":
 		methodProvided = true
 		method = args[0]
 		args = args[1:]
@@ -240,7 +258,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	postFiles := false
+	var postFiles bool
 	rawBodyFilename := "" // name of file for raw body
 	bodyparams := make(map[string]interface{})
 
@@ -265,8 +283,7 @@ func main() {
 
 	for k, v := range kvp.js {
 		var vint interface{}
-		err := json.Unmarshal([]byte(v), &vint)
-		if err != nil {
+		if err = json.Unmarshal([]byte(v), &vint); err != nil {
 			log.Fatal("invalid json: ", v)
 		}
 		bodyparams[k] = vint
@@ -296,10 +313,11 @@ func main() {
 			log.Println("extra body parameters ignored when setting raw body")
 		}
 
-		file, err := os.Open(rawBodyFilename)
-		if err != nil {
+		var file *os.File
+		if file, err = os.Open(rawBodyFilename); err != nil {
 			log.Fatal("unable to open file for body: ", err)
 		}
+		defer file.Close()
 
 		body, err = ioutil.ReadAll(file)
 		if err != nil {
@@ -316,15 +334,18 @@ func main() {
 		// write the files
 		writer := multipart.NewWriter(buf)
 		for k, v := range kvp.file {
-			part, err := writer.CreateFormFile(k, filepath.Base(v))
-			if err != nil {
+			var part io.Writer
+			if part, err = writer.CreateFormFile(k, filepath.Base(v)); err != nil {
 				log.Fatal("unable to create form file: ", err)
 			}
-			file, err := os.Open(v)
-			if err != nil {
+			var file *os.File
+			if file, err = os.Open(v); err != nil {
 				log.Fatal("unable to open file: ", err)
 			}
-			_, err = io.Copy(part, file)
+			defer file.Close()
+			if _, err = io.Copy(part, file); err != nil {
+				log.Fatal("unable to write file: ", err)
+			}
 		}
 
 		// construct the extra body parameters
@@ -349,13 +370,14 @@ func main() {
 
 		// add our files as body values
 		for k, v := range kvp.file {
-			file, err := os.Open(v)
-			if err != nil {
+			var file *os.File
+			if file, err = os.Open(v); err != nil {
 				log.Fatal("unable to open file for body: ", err)
 			}
+			defer file.Close()
 
-			val, err := ioutil.ReadAll(file)
-			if err != nil {
+			var val []byte
+			if val, err = ioutil.ReadAll(file); err != nil {
 				log.Fatal("error reading body contents: ", err)
 			}
 			// string so that we get file contents and not base64 encoded contents
@@ -377,6 +399,8 @@ func main() {
 
 	if body != nil {
 		req.Body = ioutil.NopCloser(bytes.NewReader(body))
+		req.ContentLength = int64(len(body))
+		req.Header.Set("Content-Length", strconv.Itoa(len(body)))
 		if !methodProvided {
 			req.Method = "POST"
 		}
@@ -459,6 +483,10 @@ func main() {
 			// formatted output ends with two newlines
 			os.Stdout.Write([]byte{'\n', '\n'})
 		}
+	}
+
+	if response.StatusCode >= 400 {
+		os.Exit(response.StatusCode - 399)
 	}
 }
 
