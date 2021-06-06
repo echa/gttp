@@ -14,6 +14,7 @@ import (
 	"io/ioutil"
 	"log"
 	"mime/multipart"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +23,9 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
+
+	"golang.org/x/net/http2"
 
 	"github.com/daviddengcn/go-colortext"
 )
@@ -175,32 +179,56 @@ func addValues(values url.Values, key string, vals interface{}) {
 	}
 }
 
+var (
+	h2c            bool
+	host           string
+	postform       bool
+	showHeaders    bool
+	verbose        bool
+	auth           string
+	nocolor        bool
+	noFormatting   bool
+	rawOutput      bool
+	useMultipart   bool
+	timeout        time.Duration
+	insecure       bool
+	useEnv         bool
+	method         string
+	clientCertFile string
+	clientKeyFile  string
+)
+
+func init() {
+	flag.BoolVar(&h2c, "h2c", false, "enable h2c (HTTP/2 without TLS)")
+	flag.StringVar(&host, "host", "", "overwrite http host header (may use with proxy)")
+	flag.BoolVar(&postform, "f", false, "post form")
+	flag.BoolVar(&showHeaders, "headers", false, "show headers")
+	flag.BoolVar(&verbose, "v", false, "verbose")
+	flag.StringVar(&auth, "auth", "", "username:password")
+	flag.BoolVar(&nocolor, "nocolor", false, "disable color output")
+	flag.BoolVar(&noFormatting, "n", false, "no formatting/color")
+	flag.BoolVar(&rawOutput, "raw", false, "raw output (no headers/formatting/color)")
+	flag.BoolVar(&useMultipart, "m", true, "use multipart if uploading files")
+	flag.DurationVar(&timeout, "t", 0, "timeout (default none)")
+	flag.BoolVar(&insecure, "k", false, "allow insecure TLS")
+	flag.BoolVar(&useEnv, "e", true, "use proxies from environment")
+	flag.StringVar(&method, "X", http.MethodGet, "HTTP method")
+	flag.StringVar(&clientCertFile, "cert", "", "TLS client certificate")
+	flag.StringVar(&clientKeyFile, "key", "", "TLS client key")
+}
+
 func main() {
-
-	postform := flag.Bool("f", false, "post form")
-	onlyHeaders := flag.Bool("headers", false, "only show headers")
-	onlyBody := flag.Bool("body", false, "only show body")
-	verbose := flag.Bool("v", false, "verbose")
-	auth := flag.String("auth", "", "username:password")
-	color := flag.Bool("color", true, "use color")
-	noFormatting := flag.Bool("n", false, "no formatting/colour")
-	rawOutput := flag.Bool("raw", false, "raw output (no headers/formatting/color)")
-	useMultipart := flag.Bool("m", true, "use multipart if uploading files")
-	timeout := flag.Duration("t", 0, "timeout (default none)")
-	insecure := flag.Bool("k", false, "allow insecure TLS")
-	useEnv := flag.Bool("e", true, "use proxies from environment")
-
 	flag.Parse()
+	log.SetFlags(0)
 
-	if *noFormatting {
-		*color = false
+	if noFormatting {
+		nocolor = true
 	}
 
-	if *rawOutput {
-		*onlyHeaders = false
-		*onlyBody = true
-		*color = false
-		*noFormatting = true
+	if rawOutput {
+		showHeaders = false
+		nocolor = true
+		noFormatting = true
 	}
 
 	if flag.NArg() == 0 {
@@ -208,27 +236,14 @@ func main() {
 		return
 	}
 
-	if *timeout != 0 {
-		http.DefaultClient.Timeout = *timeout
-	}
-
-	if *insecure {
-		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
-			InsecureSkipVerify: true,
-		}
-	}
-
-	if !*useEnv {
-		http.DefaultTransport.(*http.Transport).Proxy = nil
-	}
-
 	args := flag.Args()
 
-	method := "GET"
 	methodProvided := false
-	if *postform {
+	if postform {
 		methodProvided = true
-		method = "POST"
+		if method == http.MethodGet {
+			method = http.MethodPost
+		}
 	}
 
 	switch args[0] {
@@ -250,8 +265,12 @@ func main() {
 		log.Fatal("error creating request object: ", err)
 	}
 
-	if *auth != "" {
-		s := strings.SplitN(*auth, ":", 2)
+	if host != "" {
+		req.Host = host
+	}
+
+	if auth != "" {
+		s := strings.SplitN(auth, ":", 2)
 		req.SetBasicAuth(s[0], s[1])
 	}
 
@@ -286,7 +305,7 @@ func main() {
 	for k, v := range kvp.js {
 		var vint interface{}
 		if err = json.Unmarshal([]byte(v), &vint); err != nil {
-			log.Fatal("invalid json: ", v)
+			log.Fatal("invalid json: key", k, "value", v)
 		}
 		bodyparams[k] = vint
 	}
@@ -328,7 +347,7 @@ func main() {
 
 		req.Header.Add("Content-Type", "application/octet-stream")
 
-	} else if postFiles && *useMultipart {
+	} else if postFiles && useMultipart {
 
 		// we have at least one file name
 		buf := &bytes.Buffer{}
@@ -386,7 +405,7 @@ func main() {
 			bodyparams[k] = string(val)
 		}
 
-		if *postform {
+		if postform {
 			values := url.Values{}
 			for k, v := range bodyparams {
 				addValues(values, k, v)
@@ -409,7 +428,7 @@ func main() {
 	}
 
 	defaultHeaders := map[string]string{
-		"User-Agent": "gttp http for gophers",
+		"User-Agent": "gttp - http for gophers",
 		"Accept":     "*/*",
 		"Host":       req.URL.Host,
 	}
@@ -419,24 +438,64 @@ func main() {
 	}
 
 	for k, v := range kvp.headers {
+		if k == "Host" {
+			req.Host = v
+			continue
+		}
 		req.Header.Set(k, v)
 	}
 
-	if *verbose {
-		printRequestHeaders(*color, req)
+	if verbose {
+		printRequestHeaders(nocolor, req)
 		os.Stdout.Write(body)
 		os.Stdout.Write([]byte{'\n', '\n'})
 	}
 
 	client := http.DefaultClient
-	if *insecure {
-		client = &http.Client{
-			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{
-					InsecureSkipVerify: true,
-				},
+
+	if h2c {
+		client.Transport = &http2.Transport{
+			DialTLS: func(netw, addr string, cfg *tls.Config) (net.Conn, error) {
+				return net.Dial(netw, addr)
 			},
+			AllowHTTP: true,
 		}
+		tlsc := &tls.Config{
+			InsecureSkipVerify: insecure,
+		}
+		if clientCertFile != "" && clientKeyFile != "" {
+			cert, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+			if err != nil {
+				log.Fatalf("Could not load TLS client cert or key [%s]: %v", clientCertFile, err)
+			}
+			tlsc.Certificates = []tls.Certificate{cert}
+			tlsc.BuildNameToCertificate()
+		}
+		client.Transport.(*http2.Transport).TLSClientConfig = tlsc
+	} else {
+		client.Transport = http.DefaultTransport
+		if req.URL.Scheme == "https" {
+			tlsc := &tls.Config{
+				InsecureSkipVerify: insecure,
+			}
+			if clientCertFile != "" && clientKeyFile != "" {
+				cert, err := tls.LoadX509KeyPair(clientCertFile, clientKeyFile)
+				if err != nil {
+					log.Fatalf("Could not load TLS client cert or key [%s]: %v", clientCertFile, err)
+				}
+				tlsc.Certificates = []tls.Certificate{cert}
+				tlsc.BuildNameToCertificate()
+			}
+			client.Transport.(*http.Transport).TLSClientConfig = tlsc
+		}
+	}
+
+	if timeout != 0 {
+		client.Timeout = timeout
+	}
+
+	if !useEnv {
+		client.Transport.(*http.Transport).Proxy = nil
 	}
 
 	response, err := client.Do(req)
@@ -445,70 +504,61 @@ func main() {
 		log.Fatal("error during fetch:", err)
 	}
 
-	if !*onlyBody {
-		printResponseHeaders(*color, response)
+	if showHeaders || verbose {
+		printResponseHeaders(nocolor, response)
 	}
 
-	if !*onlyHeaders {
-		body, _ = ioutil.ReadAll(response.Body)
-		response.Body.Close()
+	body, _ = ioutil.ReadAll(response.Body)
+	response.Body.Close()
 
-		if *rawOutput {
-			os.Stdout.Write(body)
-		} else if *noFormatting {
+	if response.StatusCode >= 400 {
+		log.Printf("%d %s\n", response.StatusCode, http.StatusText(response.StatusCode))
+	}
 
-			if bytes.IndexByte(body, 0) != -1 {
-				os.Stdout.Write([]byte(msgNoBinaryToTerminal))
-			} else {
-				os.Stdout.Write(body)
-			}
-
+	if rawOutput {
+		os.Stdout.Write(body)
+	} else if noFormatting {
+		if bytes.IndexByte(body, 0) != -1 {
+			os.Stdout.Write([]byte(msgNoBinaryToTerminal))
 		} else {
-
-			// maybe do some formatting
-
-			switch {
-
-			case strings.HasPrefix(response.Header.Get("Content-type"), "application/json"):
-				var j interface{}
-				d := json.NewDecoder(bytes.NewReader(body))
-				d.UseNumber()
-				d.Decode(&j)
-				if *color {
-					printJSON(1, j, false)
-				} else {
-					body, _ = json.MarshalIndent(j, "", "    ")
-					os.Stdout.Write(body)
-				}
-
-			case strings.HasPrefix(response.Header.Get("Content-type"), "text/"):
+			os.Stdout.Write(body)
+		}
+	} else {
+		// maybe do some formatting
+		switch {
+		case strings.HasPrefix(response.Header.Get("Content-type"), "application/json"):
+			var j interface{}
+			d := json.NewDecoder(bytes.NewReader(body))
+			d.UseNumber()
+			d.Decode(&j)
+			if nocolor {
+				body, _ = json.MarshalIndent(j, "", "    ")
 				os.Stdout.Write(body)
-
-			case bytes.IndexByte(body, 0) != -1:
-				// at least one 0 byte, assume it's binary data :/
-				// silly, but it's the same heuristic as httpie
-				os.Stdout.Write([]byte(msgNoBinaryToTerminal))
-
-			default:
-				os.Stdout.Write(body)
+			} else {
+				printJSON(1, j, false)
 			}
 
-			// formatted output ends with two newlines
-			os.Stdout.Write([]byte{'\n', '\n'})
+		case strings.HasPrefix(response.Header.Get("Content-type"), "text/"):
+			os.Stdout.Write(body)
+
+		case bytes.IndexByte(body, 0) != -1:
+			// at least one 0 byte, assume it's binary data :/
+			// silly, but it's the same heuristic as httpie
+			os.Stdout.Write([]byte(msgNoBinaryToTerminal))
+
+		default:
+			os.Stdout.Write(body)
 		}
 	}
 
-	if response.StatusCode >= 400 {
-		os.Exit(response.StatusCode - 399)
-	}
-
-	if !*onlyBody {
-		printResponseTrailers(*color, response)
+	if showHeaders {
+		// formatted output ends with two newlines
+		os.Stdout.Write([]byte{'\n', '\n'})
+		printResponseTrailers(nocolor, response)
 	}
 }
 
 func printJSON(depth int, val interface{}, isKey bool) {
-
 	switch v := val.(type) {
 	case nil:
 		ct.ChangeColor(ct.Blue, false, ct.None, false)
@@ -602,7 +652,7 @@ func printJSON(depth int, val interface{}, isKey bool) {
 	}
 }
 
-func printRequestHeaders(useColor bool, request *http.Request) {
+func printRequestHeaders(noColor bool, request *http.Request) {
 
 	u := request.URL.Path
 	if u == "" {
@@ -613,44 +663,43 @@ func printRequestHeaders(useColor bool, request *http.Request) {
 		u += "?" + request.URL.RawQuery
 	}
 
-	if useColor {
+	if noColor {
+		fmt.Printf("%s %s %s", request.Method, u, request.Proto)
+	} else {
 		ct.ChangeColor(ct.Green, false, ct.None, false)
 		fmt.Printf("%s", request.Method)
 		ct.ChangeColor(ct.Cyan, false, ct.None, false)
 		fmt.Printf(" %s", u)
 		ct.ChangeColor(ct.Blue, false, ct.None, false)
 		fmt.Printf(" %s", request.Proto)
-	} else {
-		fmt.Printf("%s %s %s", request.Method, u, request.Proto)
 	}
 
 	fmt.Println()
-	printHeaders(useColor, request.Header)
+	printHeaders(noColor, request.Header)
 	fmt.Println()
 }
 
-func printResponseHeaders(useColor bool, response *http.Response) {
-
-	if useColor {
+func printResponseHeaders(noColor bool, response *http.Response) {
+	if noColor {
+		fmt.Printf("%s %s", response.Proto, response.Status)
+	} else {
 		ct.ChangeColor(ct.Blue, false, ct.None, false)
 		fmt.Printf("%s %s", response.Proto, response.Status[:3])
 		ct.ChangeColor(ct.Cyan, false, ct.None, false)
 		fmt.Printf("%s", response.Status[3:])
-	} else {
-		fmt.Printf("%s %s", response.Proto, response.Status)
 	}
 
 	fmt.Println()
-	printHeaders(useColor, response.Header)
+	printHeaders(noColor, response.Header)
 	fmt.Println()
 }
 
-func printResponseTrailers(useColor bool, response *http.Response) {
-	printHeaders(useColor, response.Trailer)
+func printResponseTrailers(noColor bool, response *http.Response) {
+	printHeaders(noColor, response.Trailer)
 	fmt.Println()
 }
 
-func printHeaders(useColor bool, headers http.Header) {
+func printHeaders(noColor bool, headers http.Header) {
 
 	var keys []string
 
@@ -660,7 +709,13 @@ func printHeaders(useColor bool, headers http.Header) {
 
 	sort.Strings(keys)
 
-	if useColor {
+	if noColor {
+		for _, k := range keys {
+			if len(headers[k]) > 0 {
+				fmt.Printf("%s: %s\n", k, headers[k][0])
+			}
+		}
+	} else {
 		for _, k := range keys {
 			ct.ChangeColor(ct.Cyan, false, ct.None, false)
 			fmt.Printf("%s", k)
@@ -673,13 +728,6 @@ func printHeaders(useColor bool, headers http.Header) {
 			}
 			ct.ResetColor()
 			fmt.Println()
-		}
-
-	} else {
-		for _, k := range keys {
-			if len(headers[k]) > 0 {
-				fmt.Printf("%s: %s\n", k, headers[k][0])
-			}
 		}
 	}
 }
