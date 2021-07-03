@@ -265,9 +265,10 @@ func main() {
 		log.Fatal("error creating request object: ", err)
 	}
 
-	if host != "" {
-		req.Host = host
+	if host == "" {
+		host = req.URL.Host
 	}
+	req.Host = host
 
 	if auth != "" {
 		s := strings.SplitN(auth, ":", 2)
@@ -430,7 +431,6 @@ func main() {
 	defaultHeaders := map[string]string{
 		"User-Agent": "gttp - http for gophers",
 		"Accept":     "*/*",
-		"Host":       req.URL.Host,
 	}
 
 	for k, v := range defaultHeaders {
